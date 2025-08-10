@@ -1,0 +1,33 @@
+version = 0.1
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+
+[default.deploy.parameters]
+stack_name = "downloader"
+resolve_s3 = true
+s3_prefix = "sam-app"
+region = "us-east-1"
+profile = "little-dev"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "ProjectName=\"property-scraper\" BucketName=\"my-property-data-pipeline-uploads\" OutputPrefix=\"output/html\" AttachChromiumLayer=\"false\" ChromiumLayerArn=\"\""
+image_repositories = []
+[dev.deploy.parameters]
+stack_name = "property-scraper-dev"
+region = "us-east-1"
+profile = "little-dev"
+capabilities = "CAPABILITY_NAMED_IAM"
+# optional: pin the artifacts bucket if you don't want the managed one
+# s3_bucket = "my-sam-artifacts-bucket"
+parameter_overrides = [
+  "ProjectName=property-scraper",
+  "BucketName=my-property-data-pipeline-uploads",
+  "OutputPrefix=output/html",
+  "AttachChromiumLayer=false"
+]
+
+

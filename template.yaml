@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Lambda + SQS + S3 pipeline for property HTML scraping with Puppeteer/Chromium.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: property-scraper
+  BucketName:
+    Type: String
+    Default: my-property-data-pipeline-uploads
+    Description: S3 bucket for input batches and output HTML.
+  OutputPrefix:
+    Type: String
+    Default: output/html
+  AttachChromiumLayer:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Set to 'true' to attach a Sparticuz Chromium layer ARN.
+  ChromiumLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN of Sparticuz Chromium layer (leave empty to skip).
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 120
+    MemorySize: 2048
+    EphemeralStorage:
+      Size: 1024
+    Tracing: Active
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        HTML_BUCKET: !Ref BucketName
+        OUTPUT_PREFIX: !Ref OutputPrefix
+
+Resources:
+
+  ####### S3 #######
+  HtmlBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ####### SQS #######
+  BatchQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-batches'
+      VisibilityTimeout: 360
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BatchDLQ.Arn
+        maxReceiveCount: 5
+
+  BatchDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-batches-dlq'
+
+  ####### IAM for Scraper Lambda #######
+  ScraperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessForHtml
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3RW
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+        - PolicyName: SQSConsume
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SQSReceive
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt BatchQueue.Arn
+
+  ####### Scraper Lambda #######
+  ScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lambda'
+      Description: Puppeteer/Chromium Lambda scraping property pages and saving HTML to S3.
+      Role: !GetAtt ScraperRole.Arn
+      CodeUri: ./lambda-src      # index.js lives here
+      Handler: index.handler
+      Layers: !If
+        - UseChromiumLayer
+        - [ !Ref ChromiumLayerArn ]
+        - !Ref AWS::NoValue
+
+  # Explicit SQS -> Lambda mapping so we can set MaximumConcurrency
+  ScraperESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt BatchQueue.Arn
+      FunctionName: !Ref ScraperFunction
+      Enabled: true
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+
+
+  ####### Custom Resource: create placeholder prefixes #######
+  InitPrefixesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-init-prefixes-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutForInit
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}/batches/*'
+                  - !Sub 'arn:aws:s3:::${BucketName}/${OutputPrefix}/*'
+                  - !Sub 'arn:aws:s3:::${BucketName}/batches/'
+                  - !Sub 'arn:aws:s3:::${BucketName}/${OutputPrefix}/'
+
+  InitPrefixesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-init-prefixes'
+      Role: !GetAtt InitPrefixesRole.Arn
+      Runtime: nodejs20.x
+      Timeout: 60
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          exports.handler = async (event) => {
+            const props = event.ResourceProperties || {};
+            const bucket = props.Bucket;
+            const prefixes = props.Prefixes || [];
+            try {
+              // create zero-byte objects that end with "/" so they appear as folders
+              await Promise.all(prefixes.map(prefix => {
+                const key = prefix.endsWith('/') ? prefix : prefix + '/';
+                return s3.putObject({ Bucket: bucket, Key: key, Body: '' }).promise();
+              }));
+              return { PhysicalResourceId: `${bucket}-prefixes`, Status: 'SUCCESS' };
+            } catch (e) {
+              console.error(e);
+              throw e;
+            }
+          };
+
+
+Conditions:
+  UseChromiumLayer: !Equals [ !Ref AttachChromiumLayer, 'true' ]
+
+Outputs:
+  Bucket:
+    Value: !Ref HtmlBucket
+    Description: S3 bucket for input batches and output HTML.
+  QueueUrl:
+    Value: !Ref BatchQueue
+  QueueArn:
+    Value: !GetAtt BatchQueue.Arn
+  DLQUrl:
+    Value: !Ref BatchDLQ
+  LambdaName:
+    Value: !Ref ScraperFunction

@@ -1,0 +1,14 @@
+{
+  "name": "leppa-batch-scraper",
+  "version": "1.0.0",
+  "dependencies": {
+    "puppeteer-core": "^22.0.0",
+    "@sparticuz/chromium": "^127.0.0",
+    "aws-sdk": "^2.1467.0",
+    "csv-parse": "^5.5.0",
+    "node-fetch": "^2.6.11"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}

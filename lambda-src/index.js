@@ -1,0 +1,311 @@
+const AWS = require("aws-sdk");
+const S3 = new AWS.S3();
+const chromium = require("@sparticuz/chromium");
+const puppeteer = require("puppeteer-core");
+const { parse } = require("csv-parse/sync");
+const https = require("https");
+
+const HTML_BUCKET = process.env.HTML_BUCKET || "my-property-data-pipeline-uploads-aya";
+const OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "output/html";
+
+let browser = null;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForModalAndDismiss(page, { timeout = 15000 } = {}) {
+  // Check if the modal exists at all
+  const modal = await page.$('#pnlIssues');
+  if (!modal) return;
+
+  const buttonSelector = '#pnlIssues input[name="btnContinue"]';
+
+  // Wait for button to be visible
+  await page.waitForSelector(buttonSelector, { visible: true, timeout: 5000 });
+  await page.click(buttonSelector);
+
+  // Wait for modal to disappear OR a navigation
+  await Promise.race([
+    page.waitForSelector('#pnlIssues', { hidden: true, timeout }),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch(() => {})
+  ]);
+}
+
+async function waitForPropertyData(page, { timeout = 20000 } = {}) {
+  await page.waitForSelector(
+    '#parcelLabel, .sectionTitle, table.detailsTable, .textPanel, [id*="Property"]',
+    { timeout }
+  );
+}
+
+
+
+async function getPublicIP() {
+  return new Promise((resolve, reject) => {
+    https.get("https://checkip.amazonaws.com", (res) => {
+      let ip = "";
+      res.on("data", (chunk) => { ip += chunk; });
+      res.on("end", () => resolve(ip.trim()));
+    }).on("error", (err) => reject(err));
+  });
+}
+
+async function initializeBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      ignoreDefaultArgs: ['--disable-extensions'],
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      defaultViewport: chromium.defaultViewport,
+      args: [
+        ...chromium.args,
+        '--hide-scrollbars',
+        '--disable-web-security',
+        '--no-sandbox'
+      ],
+      // CHANGED: give Chromium time to start on cold starts (or omit entirely)
+      timeout: 30000,
+    });
+  }
+  return browser;
+}
+
+async function uploadHtmlToS3(parcelId, html) {
+  const key = `${OUTPUT_PREFIX}/${parcelId}.html`;
+  await S3.putObject({
+    Bucket: HTML_BUCKET,
+    Key: key,
+    Body: html,
+    ContentType: "text/html"
+  }).promise();
+  console.log(`✅ Uploaded to s3://${HTML_BUCKET}/${key}`);
+}
+
+async function loadCsvFromS3(s3Key) {
+  const params = { Bucket: HTML_BUCKET, Key: s3Key };
+  const data = await S3.getObject(params).promise();
+  return parse(data.Body.toString("utf-8"), {
+    columns: true,
+    skip_empty_lines: true
+  });
+}
+
+async function scrapeWithPuppeteer(parcelID, url) {
+  const browser = await initializeBrowser();
+  let page = await browser.newPage();
+
+  try {
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    await page.setUserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36");
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml"
+    });
+
+    console.log(`🌐 Navigating to: ${url}`);
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+
+    // Wait a moment for any dynamic content to load
+    await sleep(2000);
+
+    // More specific continue button detection
+    const continueButtonInfo = await page.evaluate(() => {
+      // Look for the specific modal popup that contains the continue button
+      const modal = document.getElementById('pnlIssues');
+      if (!modal) return null;
+
+      const modalStyle = window.getComputedStyle(modal);
+      const isModalVisible = modalStyle.display !== 'none' &&
+                           modalStyle.visibility !== 'hidden' &&
+                           modalStyle.zIndex > 0;
+
+      if (!isModalVisible) return null;
+
+      // Look for the specific continue button within the modal
+      const continueButton = modal.querySelector('input[name="btnContinue"]') ||
+                           modal.querySelector('input[value="Continue"]') ||
+                           modal.querySelector('button[value="Continue"]');
+
+      if (!continueButton) return null;
+
+      return {
+        found: true,
+        modalId: 'pnlIssues',
+        buttonSelector: continueButton.name ? `input[name="${continueButton.name}"]` : 'input[value="Continue"]',
+        buttonText: continueButton.value || continueButton.textContent
+      };
+    });
+
+    if (continueButtonInfo && continueButtonInfo.found) {
+      console.log(`🔘 Continue modal detected for ${parcelID}, clicking continue button`);
+
+      try {
+        // Wait for the specific continue button to be clickable
+        await page.waitForSelector(continueButtonInfo.buttonSelector, {
+          visible: true,
+          timeout: 5000
+        });
+
+        // Click the continue button
+        await page.click(continueButtonInfo.buttonSelector);
+        console.log(`✅ Continue button clicked for ${parcelID}`);
+
+        // Wait for navigation or content change
+        try {
+          await Promise.race([
+            page.waitForNavigation({
+              waitUntil: "networkidle2",
+              timeout: 30000
+            }),
+            page.waitForFunction(() => {
+              const modal = document.getElementById('pnlIssues');
+              if (!modal) return true;
+              const style = window.getComputedStyle(modal);
+              return style.display === 'none' || style.visibility === 'hidden';
+            }, { timeout: 30000 })
+          ]);
+        } catch (waitError) {
+          console.log(`⚠️ Wait timeout for ${parcelID}, but continuing...`);
+        }
+
+        // Give additional time for content to fully load
+        await sleep(3000);
+
+        // Check if we need to wait for more content
+        await page.waitForFunction(() => {
+          // Look for property data indicators
+          const propertyData = document.querySelector('#parcelLabel') ||
+                             document.querySelector('.sectionTitle') ||
+                             document.querySelector('[id*="Property"]');
+          return propertyData !== null;
+        }, { timeout: 15000 }).catch(() => {
+          console.log(`⚠️ Property data elements not found quickly for ${parcelID}`);
+        });
+
+      } catch (clickError) {
+        console.error(`❌ Error clicking continue button for ${parcelID}: ${clickError.message}`);
+        // Continue anyway, might still get some data
+      }
+    } else {
+      console.log(`ℹ️ No continue modal detected for ${parcelID}`);
+    }
+
+    // Final wait to ensure all content is loaded
+    await sleep(2000);
+
+    // Extract content
+    const html = await page.content();
+
+    // Verify we have meaningful content
+    const hasPropertyData = await page.evaluate(() => {
+      // Check for key indicators that we have property data
+      const indicators = [
+        document.querySelector('#parcelLabel'),
+        document.querySelector('.sectionTitle'),
+        document.querySelector('[id*="Property"]'),
+        document.querySelector('table.detailsTable'),
+        document.querySelector('.textPanel')
+      ];
+
+      return indicators.some(el => el !== null);
+    });
+
+    if (hasPropertyData) {
+      console.log(`✅ Property data found for ${parcelID}`);
+      await uploadHtmlToS3(parcelID, html);
+    } else {
+      console.log(`⚠️ Limited property data found for ${parcelID}, saving anyway`);
+      await uploadHtmlToS3(parcelID, html);
+    }
+
+  } finally {
+    if (page && !page.isClosed()) {
+      await page.close().catch(() => {});
+    }
+  }
+}
+
+
+exports.handler = async (event) => {
+  console.log("🚀 Lambda triggered:", JSON.stringify(event));
+
+  try {
+    const ip = await getPublicIP();
+    console.log(`🌐 Lambda public IP: ${ip}`);
+  } catch (err) {
+    console.warn("⚠️ Could not retrieve public IP:", err.message);
+  }
+
+  let totalSuccess = 0, totalFailed = 0;
+
+  // Process each SQS record
+  for (const record of event.Records) {
+    try {
+      const msg = JSON.parse(record.body);
+      const batchKey = msg.s3_key;
+      if (!batchKey) {
+        console.warn("⚠️ Missing s3_key");
+        continue;
+      }
+
+      console.log(`📥 Fetching CSV from: s3://${HTML_BUCKET}/${batchKey}`);
+      const rows = await loadCsvFromS3(batchKey);
+
+      if (rows.length === 0) {
+        console.warn("⚠️ Empty CSV batch.");
+        continue;
+      }
+
+      let success = 0, failed = 0;
+
+      for (const row of rows) {
+        const { parcel_id } = row;
+        const url = (row.url || "").trim();
+
+        if (!url) {
+          console.warn(`⚠️ Missing URL for parcel ${parcel_id}`);
+          failed++;
+          continue;
+        }
+
+        try {
+          await scrapeWithPuppeteer(parcel_id, url);
+          success++;
+        } catch (err) {
+          console.error(`❌ Puppeteer failed for ${parcel_id}: ${err.message}`);
+          failed++;
+        }
+      }
+
+      console.log(`✅ Batch complete. Success: ${success}, Failed: ${failed}`);
+      totalSuccess += success;
+      totalFailed += failed;
+
+    } catch (err) {
+      console.error(`❌ Error processing record: ${err.message}`);
+      totalFailed++;
+    }
+  }
+
+  // Clean up browser
+  if (browser) {
+    try {
+      await browser.close();
+      console.log("🔒 Browser closed.");
+    } catch (e) {
+      console.warn("⚠️ Error closing browser:", e.message);
+    }
+    browser = null;
+  }
+
+  console.log(`🎯 Function complete. Total Success: ${totalSuccess}, Total Failed: ${totalFailed}`);
+  process.exit(0);
+
+};
+
+
+
