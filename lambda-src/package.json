@@ -6,7 +6,8 @@
     "@sparticuz/chromium": "^127.0.0",
     "aws-sdk": "^2.1467.0",
     "csv-parse": "^5.5.0",
-    "node-fetch": "^2.6.11"
+    "node-fetch": "^2.6.11",
+    "adm-zip": "^0.5.10"
   },
   "engines": {
     "node": ">=18.x"

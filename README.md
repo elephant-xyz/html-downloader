@@ -17,9 +17,11 @@ sam deploy \
   --no-confirm-changeset \
   --parameter-overrides \
     ProjectName=downloader-v2 \
-    BucketName=my-property-data-pipeline-uploads-aya-v2 \
+    BucketName=my-property-data-pipeline-uploads-aya \
     OutputPrefix=output/html \
     AttachChromiumLayer=false
 ```
+
+
 
 

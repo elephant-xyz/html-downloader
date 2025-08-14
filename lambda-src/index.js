@@ -4,9 +4,12 @@ const chromium = require("@sparticuz/chromium");
 const puppeteer = require("puppeteer-core");
 const { parse } = require("csv-parse/sync");
 const https = require("https");
+const AdmZip = require("adm-zip");
 
 const HTML_BUCKET = process.env.HTML_BUCKET || "my-property-data-pipeline-uploads-aya";
 const OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "output/html";
+const RETRY_LIMIT = parseInt(process.env.RETRY_LIMIT || "3", 10);
+const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || "5000", 10);
 
 let browser = null;
 
@@ -71,15 +74,15 @@ async function initializeBrowser() {
   return browser;
 }
 
-async function uploadHtmlToS3(parcelId, html) {
-  const key = `${OUTPUT_PREFIX}/${parcelId}.html`;
+async function uploadZipToS3(parcelId, zipBuffer) {
+  const key = `${OUTPUT_PREFIX}/${parcelId}.zip`;
   await S3.putObject({
     Bucket: HTML_BUCKET,
     Key: key,
-    Body: html,
-    ContentType: "text/html"
+    Body: zipBuffer,
+    ContentType: "application/zip"
   }).promise();
-  console.log(`✅ Uploaded to s3://${HTML_BUCKET}/${key}`);
+  console.log(`✅ Uploaded zip to s3://${HTML_BUCKET}/${key}`);
 }
 
 async function loadCsvFromS3(s3Key) {
@@ -91,10 +94,7 @@ async function loadCsvFromS3(s3Key) {
   });
 }
 
-async function scrapeWithPuppeteer(parcelID, url) {
-  const browser = await initializeBrowser();
-  let page = await browser.newPage();
-
+async function scrapeOnPage(page, parcelID, url) {
   try {
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -109,8 +109,19 @@ async function scrapeWithPuppeteer(parcelID, url) {
     console.log(`🌐 Navigating to: ${url}`);
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
 
-    // Wait a moment for any dynamic content to load
-    await sleep(2000);
+    // Wait for either the issues modal to appear or any property data indicator to show up
+    await Promise.race([
+      page.waitForSelector('#pnlIssues', { visible: true, timeout: 8000 }).catch(() => {}),
+      page.waitForFunction(() => {
+        return (
+          document.querySelector('#parcelLabel') ||
+          document.querySelector('.sectionTitle') ||
+          document.querySelector('table.detailsTable') ||
+          document.querySelector('.textPanel') ||
+          document.querySelector('[id*="Property"]')
+        );
+      }, { timeout: 15000 }).catch(() => {})
+    ]);
 
     // More specific continue button detection
     const continueButtonInfo = await page.evaluate(() => {
@@ -172,9 +183,6 @@ async function scrapeWithPuppeteer(parcelID, url) {
           console.log(`⚠️ Wait timeout for ${parcelID}, but continuing...`);
         }
 
-        // Give additional time for content to fully load
-        await sleep(3000);
-
         // Check if we need to wait for more content
         await page.waitForFunction(() => {
           // Look for property data indicators
@@ -194,8 +202,16 @@ async function scrapeWithPuppeteer(parcelID, url) {
       console.log(`ℹ️ No continue modal detected for ${parcelID}`);
     }
 
-    // Final wait to ensure all content is loaded
-    await sleep(2000);
+    // Final ensure: wait a bit for any property data indicator if not already present
+    await page.waitForFunction(() => {
+      return (
+        document.querySelector('#parcelLabel') ||
+        document.querySelector('.sectionTitle') ||
+        document.querySelector('table.detailsTable') ||
+        document.querySelector('.textPanel') ||
+        document.querySelector('[id*="Property"]')
+      );
+    }, { timeout: 5000 }).catch(() => {});
 
     // Extract content
     const html = await page.content();
@@ -216,12 +232,26 @@ async function scrapeWithPuppeteer(parcelID, url) {
 
     if (hasPropertyData) {
       console.log(`✅ Property data found for ${parcelID}`);
-      await uploadHtmlToS3(parcelID, html);
+      return html;
     } else {
-      console.log(`⚠️ Limited property data found for ${parcelID}, saving anyway`);
-      await uploadHtmlToS3(parcelID, html);
+      console.log(`⚠️ Limited property data found for ${parcelID}`);
+      // Signal to caller to retry this parcel
+      const err = new Error("LIMITED_PROPERTY_DATA");
+      err.code = "LIMITED_PROPERTY_DATA";
+      throw err;
     }
 
+  } finally {
+    // Do not close the page here; caller manages lifecycle for reuse across retries
+  }
+}
+
+// Backward-compatible wrapper; kept in case other callers rely on previous behavior
+async function scrapeWithPuppeteer(parcelID, url) {
+  const browser = await initializeBrowser();
+  const page = await browser.newPage();
+  try {
+    return await scrapeOnPage(page, parcelID, url);
   } finally {
     if (page && !page.isClosed()) {
       await page.close().catch(() => {});
@@ -242,8 +272,11 @@ exports.handler = async (event) => {
 
   let totalSuccess = 0, totalFailed = 0;
 
+  const batchItemFailures = [];
+
   // Process each SQS record
   for (const record of event.Records) {
+    let recordShouldFail = false;
     try {
       const msg = JSON.parse(record.body);
       const batchKey = msg.s3_key;
@@ -272,12 +305,57 @@ exports.handler = async (event) => {
           continue;
         }
 
+        const browserInstance = await initializeBrowser();
+        const page = await browserInstance.newPage();
         try {
-          await scrapeWithPuppeteer(parcel_id, url);
-          success++;
-        } catch (err) {
-          console.error(`❌ Puppeteer failed for ${parcel_id}: ${err.message}`);
-          failed++;
+          let attempt = 0;
+          let completed = false;
+          let html = null;
+          while (attempt < RETRY_LIMIT && !completed) {
+            try {
+              html = await scrapeOnPage(page, parcel_id, url);
+              success++;
+              completed = true;
+            } catch (err) {
+              const isLimited = err && (err.code === "LIMITED_PROPERTY_DATA" || err.message === "LIMITED_PROPERTY_DATA");
+              attempt++;
+              if (isLimited && attempt < RETRY_LIMIT) {
+                const backoff = RETRY_DELAY_MS * attempt;
+                console.warn(`↻ Retry ${attempt}/${RETRY_LIMIT} for parcel ${parcel_id} due to limited data. Waiting ${backoff}ms...`);
+                await sleep(backoff);
+                continue;
+              }
+              console.error(`❌ Scrape failed for ${parcel_id} (attempt ${attempt}): ${err && err.message}`);
+              failed++;
+              if (isLimited && attempt >= RETRY_LIMIT) {
+                // Mark entire SQS record to be retried/ DLQ'd after SQS redrive
+                recordShouldFail = true;
+              }
+              break;
+            }
+          }
+
+          if (completed && html !== null) {
+            // Create seed.csv for this row with headers
+            const headers = Object.keys(row);
+            const csvHeader = headers.join(',') + '\n';
+            const csvRow = headers.map(h => {
+              const val = row[h] == null ? '' : String(row[h]);
+              const needsQuotes = /[",\n]/.test(val);
+              const escaped = val.replace(/"/g, '""');
+              return needsQuotes ? `"${escaped}"` : escaped;
+            }).join(',') + '\n';
+
+            const zip = new AdmZip();
+            zip.addFile('seed.csv', Buffer.from(csvHeader + csvRow, 'utf-8'));
+            zip.addFile(`${parcel_id}.html`, Buffer.from(html, 'utf-8'));
+            const zipBuffer = zip.toBuffer();
+            await uploadZipToS3(parcel_id, zipBuffer);
+          }
+        } finally {
+          if (page && !page.isClosed()) {
+            await page.close().catch(() => {});
+          }
         }
       }
 
@@ -288,6 +366,11 @@ exports.handler = async (event) => {
     } catch (err) {
       console.error(`❌ Error processing record: ${err.message}`);
       totalFailed++;
+      recordShouldFail = true;
+    }
+
+    if (recordShouldFail && record && record.messageId) {
+      batchItemFailures.push({ itemIdentifier: record.messageId });
     }
   }
 
@@ -303,7 +386,13 @@ exports.handler = async (event) => {
   }
 
   console.log(`🎯 Function complete. Total Success: ${totalSuccess}, Total Failed: ${totalFailed}`);
-  process.exit(0);
+
+  // Enable partial batch failures so SQS can retry/route to DLQ
+  if (batchItemFailures.length > 0) {
+    return { batchItemFailures };
+  }
+
+  return {};
 
 };
 

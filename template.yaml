@@ -131,6 +131,57 @@ Resources:
       Enabled: true
       BatchSize: 1
       MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  ####### Tools: Deploy Timestamp Setter Lambda #######
+  DeployTsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-deploy-ts-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UpdateTargetLambdaEnv
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !GetAtt ScraperFunction.Arn
+
+  DeployTsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-deploy-ts'
+      Description: Updates a target Lambda env var with the current UTC timestamp.
+      Role: !GetAtt DeployTsRole.Arn
+      Runtime: python3.13
+      Timeout: 30
+      MemorySize: 128
+      CodeUri: ./lambda-tools/deploy-ts
+      Handler: handler.handler
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Sub '${ProjectName}-lambda'
+          VAR_NAME: DEPLOY_TS
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Name: !Sub '${ProjectName}-deploy-ts-every-minute'
+            Description: Invoke deploy-ts updater every minute
+            Enabled: true
 
 
   ####### Custom Resource: create placeholder prefixes #######
