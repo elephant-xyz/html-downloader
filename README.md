@@ -77,15 +77,27 @@ sam deploy \
     OutputPrefix=output/html \
     AttachChromiumLayer=false
 ```
+---
 
-#Post-Deployment Setup
+# Post-Deployment Setup
 
-IN THE LAMDA SQS trigget set the concurrency to $35
-Batch size: 35 → keeps AWS costs around $20/day.
+## Configure the SQS Trigger
 
-Can increase up to 150 for faster processing and the daily cost will increase accordingly.
+After deployment, open the Scraper Lambda configuration and adjust the SQS trigger settings:
 
-Warning: Going above 150 may risk overloading county websites.
+- **Batch size:** Set to `35` — this typically keeps AWS costs around **$20/day**. Increase up to `150` for faster processing if your budget allows.  
+  ⚠ **Warning:** Batch sizes above `150` may overwhelm county property websites and risk IP blocking.
+- **Concurrency control:** If needed, adjust the reserved concurrency to control the number of parallel Lambda executions.
+
+---
+
+## Split and Upload the Seed File
+
+Before starting the process, split your `seed.csv` into smaller batches and upload them to S3:
+
+```bash
+python split-and-push.py
+
 
 
 
