@@ -21,7 +21,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 # ✅ Constants (aligned with push-batches.py)
 # ----------------------------------------
 BATCH_FOLDER = "./batches"
-S3_BUCKET_DEFAULT = "my-property-data-pipeline-uploads-test"
+S3_BUCKET_DEFAULT = "my-property-data-pipeline-uploads"
 S3_PREFIX_DEFAULT = "batches"
 SQS_QUEUE_NAME_DEFAULT = "downloader-v2-batches"
 

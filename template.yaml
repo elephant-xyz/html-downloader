@@ -22,6 +22,15 @@ Parameters:
     Type: String
     Default: ''
     Description: ARN of Sparticuz Chromium layer (leave empty to skip).
+  ExistingBucketName:
+      Type: String
+      Default: ""
+      Description: "If set, use this bucket and do NOT create one."    
+
+
+Conditions:
+  UseChromiumLayer: !Equals [ !Ref AttachChromiumLayer, 'true' ]
+  CreateBucket: !Equals [!Ref ExistingBucketName, ""]    
 
 Globals:
   Function:
@@ -42,6 +51,7 @@ Resources:
   ####### S3 #######
   HtmlBucket:
     Type: AWS::S3::Bucket
+    Condition: CreateBucket
     Properties:
       BucketName: !Ref BucketName
       VersioningConfiguration:
@@ -241,12 +251,11 @@ Resources:
           };
 
 
-Conditions:
-  UseChromiumLayer: !Equals [ !Ref AttachChromiumLayer, 'true' ]
+
 
 Outputs:
   Bucket:
-    Value: !Ref HtmlBucket
+    Value: !If [ CreateBucket, !Ref HtmlBucket, !Ref ExistingBucketName ]
     Description: S3 bucket for input batches and output HTML.
   QueueUrl:
     Value: !Ref BatchQueue

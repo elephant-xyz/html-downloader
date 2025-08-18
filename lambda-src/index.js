@@ -8,6 +8,7 @@ const AdmZip = require("adm-zip");
 
 const HTML_BUCKET = process.env.HTML_BUCKET || "my-property-data-pipeline-uploads-aya";
 const OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "output/html";
+const ERRORS_KEY = process.env.ERRORS_KEY || "errors.csv";
 const RETRY_LIMIT = parseInt(process.env.RETRY_LIMIT || "3", 10);
 const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS || "5000", 10);
 
@@ -74,8 +75,21 @@ async function initializeBrowser() {
   return browser;
 }
 
+function formatUtcTimestamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = d.getUTCFullYear();
+  const m = pad(d.getUTCMonth() + 1);
+  const day = pad(d.getUTCDate());
+  const hh = pad(d.getUTCHours());
+  const mm = pad(d.getUTCMinutes());
+  const ss = pad(d.getUTCSeconds());
+  return `${y}${m}${day}T${hh}${mm}${ss}Z`;
+}
+
 async function uploadZipToS3(parcelId, zipBuffer) {
-  const key = `${OUTPUT_PREFIX}/${parcelId}.zip`;
+  const ts = formatUtcTimestamp();
+  const key = `${OUTPUT_PREFIX}/${parcelId}-${ts}.zip`;
   await S3.putObject({
     Bucket: HTML_BUCKET,
     Key: key,
@@ -92,6 +106,98 @@ async function loadCsvFromS3(s3Key) {
     columns: true,
     skip_empty_lines: true
   });
+}
+
+function buildUrlFromRow(row) {
+  const baseUrl = (row.url || "").trim();
+  const multiValueRaw = (row.multiValueQueryString || "").trim();
+  if (!baseUrl) return "";
+  try {
+    const urlObj = new URL(baseUrl);
+    if (!multiValueRaw) return urlObj.toString();
+
+    // Try JSON first (e.g., { "key": ["v1", "v2"], "x": ["y"] })
+    let appended = false;
+    if (multiValueRaw.startsWith("{") || multiValueRaw.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(multiValueRaw);
+        if (parsed && typeof parsed === "object") {
+          for (const [key, value] of Object.entries(parsed)) {
+            if (Array.isArray(value)) {
+              for (const v of value) {
+                urlObj.searchParams.append(key, String(v));
+              }
+            } else if (value != null) {
+              urlObj.searchParams.append(key, String(value));
+            }
+          }
+          appended = true;
+        }
+      } catch (_) {
+        // fall through to querystring parsing
+      }
+    }
+
+    if (!appended) {
+      // Treat as standard querystring: a=1&b=2&c=3
+      const params = new URLSearchParams(multiValueRaw);
+      for (const [k, v] of params.entries()) {
+        urlObj.searchParams.append(k, v);
+      }
+    }
+    return urlObj.toString();
+  } catch (_e) {
+    // If base URL is not fully qualified, return as-is with raw query appended
+    if (!multiValueRaw) return baseUrl;
+    const joiner = baseUrl.includes("?") ? "&" : "?";
+    return `${baseUrl}${joiner}${multiValueRaw}`;
+  }
+}
+
+function escapeCsvValue(value) {
+  const str = value == null ? '' : String(value);
+  const needsQuotes = /[",\n]/.test(str);
+  const escaped = str.replace(/"/g, '""');
+  return needsQuotes ? `"${escaped}"` : escaped;
+}
+
+function rowToCsvLine(headers, row) {
+  return headers.map(h => escapeCsvValue(row[h])).join(',');
+}
+
+async function appendRowsToErrorsCsv(headers, rows) {
+  if (!rows || rows.length === 0) return;
+  let existing = '';
+  let hasExisting = false;
+  try {
+    const res = await S3.getObject({ Bucket: HTML_BUCKET, Key: ERRORS_KEY }).promise();
+    existing = res.Body.toString('utf-8');
+    hasExisting = true;
+  } catch (e) {
+    const code = e.code || (e.$metadata && e.$metadata.httpStatusCode);
+    hasExisting = false;
+  }
+
+  let output = '';
+  if (!hasExisting || existing.trim().length === 0) {
+    output += headers.join(',') + '\n';
+  } else {
+    output += existing;
+    if (!existing.endsWith('\n')) {
+      output += '\n';
+    }
+  }
+
+  for (const r of rows) {
+    output += rowToCsvLine(headers, r) + '\n';
+  }
+
+  await S3.putObject({
+    Bucket: HTML_BUCKET,
+    Key: ERRORS_KEY,
+    Body: Buffer.from(output, 'utf-8'),
+    ContentType: 'text/csv'
+  }).promise();
 }
 
 async function scrapeOnPage(page, parcelID, url) {
@@ -294,10 +400,15 @@ exports.handler = async (event) => {
       }
 
       let success = 0, failed = 0;
+      let headersForErrors = null;
+      const failedRowsBuffer = [];
 
       for (const row of rows) {
+        if (!headersForErrors) {
+          headersForErrors = Object.keys(row);
+        }
         const { parcel_id } = row;
-        const url = (row.url || "").trim();
+        const url = buildUrlFromRow(row);
 
         if (!url) {
           console.warn(`⚠️ Missing URL for parcel ${parcel_id}`);
@@ -331,6 +442,8 @@ exports.handler = async (event) => {
                 // Mark entire SQS record to be retried/ DLQ'd after SQS redrive
                 recordShouldFail = true;
               }
+              // capture failed row for errors.csv
+              failedRowsBuffer.push(row);
               break;
             }
           }
@@ -360,6 +473,14 @@ exports.handler = async (event) => {
       }
 
       console.log(`✅ Batch complete. Success: ${success}, Failed: ${failed}`);
+      if (failedRowsBuffer.length > 0 && headersForErrors) {
+        try {
+          await appendRowsToErrorsCsv(headersForErrors, failedRowsBuffer);
+          console.log(`📄 Appended ${failedRowsBuffer.length} failed row(s) to s3://${HTML_BUCKET}/${ERRORS_KEY}`);
+        } catch (e) {
+          console.warn(`⚠️ Failed to append errors.csv: ${e && e.message}`);
+        }
+      }
       totalSuccess += success;
       totalFailed += failed;
 
@@ -398,3 +519,13 @@ exports.handler = async (event) => {
 
 
 
+
+// Expose test helpers when running under test
+if ((process.env.NODE_ENV || '').toLowerCase() === 'test') {
+  module.exports._test = {
+    buildUrlFromRow,
+    escapeCsvValue,
+    rowToCsvLine,
+    appendRowsToErrorsCsv,
+  };
+}
